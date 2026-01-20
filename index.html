@@ -3,30 +3,125 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Competing Game of Life - Optimized</title>
+    <title>Competing Game of Life - UI Controls</title>
     <style>
         body {
             margin: 0;
             overflow: hidden;
+            background-color: #111;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #eee;
+        }
+
+        /* Canvas container to ensure it stays behind UI */
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 0;
             display: flex;
             justify-content: center;
             align-items: center;
-            min-height: 100vh;
-            background-color: #111;
         }
+
         canvas {
-            border: 1px solid #444;
+            border: 1px solid #333;
+            /* Ensure pixels stay sharp */
+            image-rendering: pixelated; 
             max-width: 100vw;
             max-height: 100vh;
             object-fit: contain;
-            /* Keeps the pixels sharp instead of blurry when scaled */
-            image-rendering: pixelated;
-            image-rendering: crisp-edges;
         }
+
+        /* UI Overlay */
+        #ui-layer {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            
+            background-color: rgba(30, 30, 30, 0.85);
+            backdrop-filter: blur(5px);
+            padding: 10px 20px;
+            border-radius: 50px;
+            border: 1px solid #555;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        button {
+            background-color: #444;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.2s ease;
+        }
+
+        button:hover {
+            background-color: #666;
+            transform: translateY(-1px);
+        }
+
+        button:active {
+            transform: translateY(1px);
+        }
+
+        /* Specific button colors */
+        #btn-play.running { background-color: #d9534f; } /* Red when running (Stop) */
+        #btn-play.paused { background-color: #5cb85c; }  /* Green when paused (Play) */
+
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-left: 1px solid #555;
+            padding-left: 15px;
+        }
+
+        label {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #aaa;
+        }
+
+        input[type=range] {
+            width: 100px;
+            cursor: pointer;
+        }
+
     </style>
 </head>
 <body>
-    <canvas id="golCanvas"></canvas>
+
+    <div id="canvas-container">
+        <canvas id="golCanvas"></canvas>
+    </div>
+
+    <div id="ui-layer">
+        <button id="btn-play" class="running">Pause</button>
+        <button id="btn-step">Step</button>
+        
+        <div class="control-group">
+            <button id="btn-random">Random</button>
+            <button id="btn-clear">Clear</button>
+        </div>
+
+        <div class="control-group">
+            <label for="speed-slider">Speed</label>
+            <input type="range" id="speed-slider" min="1" max="100" value="50">
+        </div>
+    </div>
 
     <script>
         'use strict';
@@ -35,127 +130,245 @@
         const GRID_WIDTH = 1600;
         const GRID_HEIGHT = 1200;
         const GRID_SIZE = GRID_WIDTH * GRID_HEIGHT;
-        const UPDATE_INTERVAL_MS = 50;
+        
+        // Simulation State
+        let isRunning = true;
+        let updateIntervalMs = 50; // Controlled by slider
+        let lastTime = 0;
 
         // States
         const DEAD = 0, WHITE = 1, RED = 2, BLUE = 3;
         const NUM_COLORS = 3;
         const STATE_COLORS = [
-            [0, 0, 0, 255],       // DEAD
+            [0, 0, 0, 255],       // DEAD (Black)
             [255, 255, 255, 255], // WHITE
             [255, 50, 50, 255],   // RED
             [50, 50, 255, 255]    // BLUE
         ];
 
-        // Simulation Buffers
+        // --- Memory Allocation (Static Buffers) ---
         let currentGrid = new Uint8Array(GRID_SIZE);
         let nextGrid = new Uint8Array(GRID_SIZE);
-        const neighborCounts = new Int32Array(NUM_COLORS); // Reusable buffer to prevent GC
+        
+        // Optimization buffers
+        const neighborCounts = new Int32Array(NUM_COLORS); 
+        const birthQueue = new Int32Array(GRID_SIZE); 
+        let birthQueueCount = 0;
+        const victimCandidates = new Int32Array(8);
 
-        // --- Setup Canvas ---
+        // --- Canvas Setup ---
         const canvas = document.getElementById('golCanvas');
         const ctx = canvas.getContext('2d', { alpha: false });
         canvas.width = GRID_WIDTH;
         canvas.height = GRID_HEIGHT;
 
         const imageData = ctx.createImageData(GRID_WIDTH, GRID_HEIGHT);
-        const buf32 = new Uint32Array(imageData.data.buffer); // Faster 32-bit pixel access
+        const buf32 = new Uint32Array(imageData.data.buffer);
 
-        // Pre-calculate 32-bit colors for the buffer
-        const COLORS_32 = STATE_COLORS.map(c => 
-            (c[3] << 24) | (c[2] << 16) | (c[1] << 8) | c[0]
-        );
+        // Endianness check
+        const isLittleEndian = (() => {
+            const buffer = new ArrayBuffer(4);
+            new Uint8Array(buffer)[0] = 1;
+            return new Uint32Array(buffer)[0] === 1;
+        })();
+
+        // Pre-calculate 32-bit colors
+        const COLORS_32 = STATE_COLORS.map(c => {
+            if (isLittleEndian) {
+                return (c[3] << 24) | (c[2] << 16) | (c[1] << 8) | c[0];
+            } else {
+                return (c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3];
+            }
+        });
 
         // --- PRNG ---
         let seed = Date.now();
         function fastRandom() {
-            seed = (seed * 1664525 + 1013904223) % 4294967296;
-            return seed / 4294967296;
+            let t = seed += 0x6D2B79F5;
+            t = Math.imul(t ^ t >>> 15, t | 1);
+            t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+            return ((t ^ t >>> 14) >>> 0) / 4294967296;
         }
 
         // --- Logic ---
 
-        function getWrappedIdx(x, y) {
-            let wx = x;
-            let wy = y;
-            if (wx < 0) wx = GRID_WIDTH - 1; else if (wx >= GRID_WIDTH) wx = 0;
-            if (wy < 0) wy = GRID_HEIGHT - 1; else if (wy >= GRID_HEIGHT) wy = 0;
-            return wy * GRID_WIDTH + wx;
-        }
-
         function computeNextGeneration() {
-            // Copy current to next as a baseline
-            nextGrid.set(currentGrid);
+            birthQueueCount = 0; 
 
+            // PASS 1: Calculate Survival and Queued Births
             for (let y = 0; y < GRID_HEIGHT; y++) {
                 for (let x = 0; x < GRID_WIDTH; x++) {
                     const idx = y * GRID_WIDTH + x;
                     const currentState = currentGrid[idx];
 
-                    // Count neighbors efficiently
-                    neighborCounts.fill(0);
+                    // Reset counts
+                    neighborCounts[0] = 0; neighborCounts[1] = 0; neighborCounts[2] = 0;
+
+                    // Count Neighbors
                     for (let dy = -1; dy <= 1; dy++) {
                         for (let dx = -1; dx <= 1; dx++) {
                             if (dx === 0 && dy === 0) continue;
-                            const nIdx = getWrappedIdx(x + dx, y + dy);
-                            const nState = currentGrid[nIdx];
+                            
+                            // Inline wrap
+                            let nx = x + dx;
+                            let ny = y + dy;
+                            if (nx < 0) nx = GRID_WIDTH - 1; else if (nx >= GRID_WIDTH) nx = 0;
+                            if (ny < 0) ny = GRID_HEIGHT - 1; else if (ny >= GRID_HEIGHT) ny = 0;
+                            
+                            const nState = currentGrid[ny * GRID_WIDTH + nx];
                             if (nState !== DEAD) neighborCounts[nState - 1]++;
                         }
                     }
 
                     if (currentState === DEAD) {
-                        // Birth Logic
                         let birthColor = 0;
                         let candidates = 0;
-                        for (let i = 0; i < NUM_COLORS; i++) {
-                            if (neighborCounts[i] === 3) {
-                                birthColor = i + 1;
-                                candidates++;
-                            }
-                        }
+                        if (neighborCounts[0] === 3) { birthColor = 1; candidates++; }
+                        if (neighborCounts[1] === 3) { birthColor = 2; candidates++; }
+                        if (neighborCounts[2] === 3) { birthColor = 3; candidates++; }
 
                         if (candidates === 1) {
                             nextGrid[idx] = birthColor;
-                            // Retaliation: Kill one random neighbor of a different color
-                            applyRetaliation(x, y, birthColor);
+                            birthQueue[birthQueueCount++] = idx;
+                        } else {
+                            nextGrid[idx] = DEAD;
                         }
                     } else {
-                        // Survival Logic
                         const sameColorCount = neighborCounts[currentState - 1];
                         if (sameColorCount < 2 || sameColorCount > 3) {
                             nextGrid[idx] = DEAD;
+                        } else {
+                            nextGrid[idx] = currentState;
                         }
                     }
                 }
             }
-        }
 
-        function applyRetaliation(x, y, bornColor) {
-            const targets = [];
-            for (let dy = -1; dy <= 1; dy++) {
-                for (let dx = -1; dx <= 1; dx++) {
-                    if (dx === 0 && dy === 0) continue;
-                    const nIdx = getWrappedIdx(x + dx, y + dy);
-                    const nState = currentGrid[nIdx];
-                    if (nState !== DEAD && nState !== bornColor) {
-                        targets.push(nIdx);
+            // PASS 2: Retaliation
+            for (let i = 0; i < birthQueueCount; i++) {
+                const idx = birthQueue[i];
+                const bornColor = nextGrid[idx];
+                const cy = Math.floor(idx / GRID_WIDTH);
+                const cx = idx % GRID_WIDTH;
+                
+                let victimCount = 0;
+
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        if (dx === 0 && dy === 0) continue;
+
+                        let nx = cx + dx;
+                        let ny = cy + dy;
+                        if (nx < 0) nx = GRID_WIDTH - 1; else if (nx >= GRID_WIDTH) nx = 0;
+                        if (ny < 0) ny = GRID_HEIGHT - 1; else if (ny >= GRID_HEIGHT) ny = 0;
+
+                        const nIdx = ny * GRID_WIDTH + nx;
+                        const nState = currentGrid[nIdx];
+                        
+                        // Victim must be alive and different color
+                        if (nState !== DEAD && nState !== bornColor) {
+                            victimCandidates[victimCount++] = nIdx;
+                        }
                     }
                 }
-            }
-            if (targets.length > 0) {
-                const victimIdx = targets[Math.floor(fastRandom() * targets.length)];
-                nextGrid[victimIdx] = DEAD;
+
+                if (victimCount > 0) {
+                    const randIndex = Math.floor(fastRandom() * victimCount);
+                    nextGrid[victimCandidates[randIndex]] = DEAD;
+                }
             }
         }
 
         function render() {
+            // Because we swap buffers, currentGrid holds the latest frame data
             for (let i = 0; i < GRID_SIZE; i++) {
                 buf32[i] = COLORS_32[currentGrid[i]];
             }
             ctx.putImageData(imageData, 0, 0);
         }
 
-        // --- Interaction ---
+        function swapBuffers() {
+            let temp = currentGrid;
+            currentGrid = nextGrid;
+            nextGrid = temp;
+        }
+
+        function initRandom() {
+            for (let i = 0; i < GRID_SIZE; i++) {
+                if (fastRandom() > 0.85) {
+                    currentGrid[i] = Math.floor(fastRandom() * NUM_COLORS) + 1;
+                } else {
+                    currentGrid[i] = DEAD;
+                }
+            }
+            nextGrid.set(currentGrid);
+            render();
+        }
+
+        function clearGrid() {
+            currentGrid.fill(DEAD);
+            nextGrid.fill(DEAD);
+            render();
+        }
+
+        // --- Interaction Handlers ---
+
+        const btnPlay = document.getElementById('btn-play');
+        const btnStep = document.getElementById('btn-step');
+        const btnRandom = document.getElementById('btn-random');
+        const btnClear = document.getElementById('btn-clear');
+        const sliderSpeed = document.getElementById('speed-slider');
+
+        btnPlay.addEventListener('click', () => {
+            isRunning = !isRunning;
+            if (isRunning) {
+                btnPlay.textContent = "Pause";
+                btnPlay.className = "running";
+                lastTime = performance.now();
+                requestAnimationFrame(loop);
+            } else {
+                btnPlay.textContent = "Play";
+                btnPlay.className = "paused";
+            }
+        });
+
+        btnStep.addEventListener('click', () => {
+            // Force pause if stepping
+            if (isRunning) {
+                isRunning = false;
+                btnPlay.textContent = "Play";
+                btnPlay.className = "paused";
+            }
+            computeNextGeneration();
+            swapBuffers();
+            render();
+        });
+
+        btnRandom.addEventListener('click', () => {
+            initRandom();
+        });
+
+        btnClear.addEventListener('click', () => {
+            clearGrid();
+            // Also stop the simulation so it doesn't just sit there processing empty frames
+            if(isRunning) {
+                isRunning = false;
+                btnPlay.textContent = "Play";
+                btnPlay.className = "paused";
+            }
+        });
+
+        sliderSpeed.addEventListener('input', (e) => {
+            // Map 1-100 to roughly 200ms-1ms
+            // Logarithmic feel or simple inverse often feels better
+            // Simple mapping:
+            const val = parseInt(e.target.value);
+            // Invert: 100 -> 0ms delay, 1 -> 200ms delay
+            updateIntervalMs = Math.floor(200 - (val * 1.9)); 
+            if (updateIntervalMs < 0) updateIntervalMs = 0;
+        });
+
+        // Mouse Painting
         canvas.addEventListener('mousedown', (e) => {
             const rect = canvas.getBoundingClientRect();
             const scaleX = GRID_WIDTH / rect.width;
@@ -168,35 +381,28 @@
                 const dist = fastRandom() * 30;
                 const rx = Math.floor(cx + Math.cos(angle) * dist);
                 const ry = Math.floor(cy + Math.sin(angle) * dist);
-                const idx = getWrappedIdx(rx, ry);
+                const idx = (ry * GRID_WIDTH + rx + GRID_SIZE) % GRID_SIZE; // Simple safety wrap
                 currentGrid[idx] = Math.floor(fastRandom() * NUM_COLORS) + 1;
             }
-            render();
+            // If paused, we need to render manually to see the splash
+            if (!isRunning) render();
         });
 
-        // --- Loop ---
-        let lastTime = 0;
+        // --- Main Loop ---
         function loop(timestamp) {
-            if (timestamp - lastTime >= UPDATE_INTERVAL_MS) {
+            if (!isRunning) return;
+
+            if (timestamp - lastTime >= updateIntervalMs) {
                 computeNextGeneration();
-                // Swap buffers
-                let temp = currentGrid;
-                currentGrid = nextGrid;
-                nextGrid = temp;
-                
+                swapBuffers();
                 render();
                 lastTime = timestamp;
             }
             requestAnimationFrame(loop);
         }
 
-        // Initialize
-        for (let i = 0; i < GRID_SIZE; i++) {
-            if (fastRandom() > 0.85) {
-                currentGrid[i] = Math.floor(fastRandom() * NUM_COLORS) + 1;
-            }
-        }
-
+        // Start
+        initRandom();
         requestAnimationFrame(loop);
 
     </script>
